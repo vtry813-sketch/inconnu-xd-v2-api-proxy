@@ -12,7 +12,7 @@ export const CONFIG = {
     MAX_SESSIONS_PER_SERVER: parseInt(process.env.MAX_SESSIONS_PER_SERVER) || 25,
     
     // Timeouts and intervals
-    REQUEST_TIMEOUT: parseInt(process.env.REQUEST_TIMEOUT) || 5000,
+    REQUEST_TIMEOUT: parseInt(process.env.REQUEST_TIMEOUT) || 30000, // 30 secondes pour pairing
     HEALTH_CHECK_INTERVAL: parseInt(process.env.HEALTH_CHECK_INTERVAL) || 10000,
     SESSION_CACHE_TTL: parseInt(process.env.SESSION_CACHE_TTL) || 5000,
     
