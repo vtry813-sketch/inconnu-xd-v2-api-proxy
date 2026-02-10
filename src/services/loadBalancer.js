@@ -86,13 +86,24 @@ class LoadBalancer {
      */
     async forwardRequest(req, server, retries = 0) {
         const { method, originalUrl, body, headers } = req;
-        const targetUrl = `${server.url}${originalUrl}`;
         
-        logger.info('Forwarding request', {
+        // VOTRE BACKEND ATTEND /pair/:num/ AVEC UN SLASH À LA FIN
+        // On doit reconstruire l'URL correctement
+        let path = originalUrl;
+        if (originalUrl.match(/^\/pair\/[^\/]+$/)) {
+            // Ajouter le slash final pour /pair/:number
+            path = originalUrl + '/';
+        }
+        
+        const targetUrl = `${server.url}${path}`;
+        
+        logger.info('Forwarding request to backend', {
             from: req.ip,
             to: server.id,
-            url: targetUrl,
+            originalUrl: originalUrl,
+            targetUrl: targetUrl,
             retry: retries,
+            number: req.params.number,
             sessionId: req.params.sessionId
         });
 
@@ -104,23 +115,30 @@ class LoadBalancer {
                     ...headers,
                     'x-forwarded-for': req.ip,
                     'x-proxy-server': server.id,
-                    host: new URL(server.url).host
+                    'x-proxy-timestamp': new Date().toISOString(),
+                    'user-agent': 'Smart-Gateway-Proxy/1.0',
+                    'accept': 'application/json'
                 },
                 timeout: CONFIG.REQUEST_TIMEOUT,
-                validateStatus: null // Don't throw on HTTP error status
+                validateStatus: function (status) {
+                    return status >= 200 && status < 600; // Accept all status codes
+                }
             };
 
             if (body && Object.keys(body).length > 0) {
                 config.data = body;
+                config.headers['content-type'] = 'application/json';
             }
 
             const response = await axios(config);
             
-            logger.debug('Backend response', {
+            logger.info('Backend response details', {
                 server: server.id,
                 status: response.status,
-                duration: response.duration,
-                sessionId: req.params.sessionId
+                statusText: response.statusText,
+                duration: response.duration ? `${response.duration}ms` : 'unknown',
+                url: targetUrl,
+                responseData: response.data
             });
 
             return {
@@ -133,11 +151,12 @@ class LoadBalancer {
                 error: error.message,
                 code: error.code,
                 retry: retries,
-                sessionId: req.params.sessionId
+                url: targetUrl,
+                stack: error.stack
             });
 
             // Mark server as unhealthy on certain errors
-            if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
+            if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
                 this.serverManager.updateServerStatus(server.id, CONFIG.STATUS.UNHEALTHY, {
                     error: error.message
                 });
@@ -148,8 +167,16 @@ class LoadBalancer {
                 await delay(CONFIG.RETRY_DELAY * (retries + 1));
                 
                 // Try to select a different server
-                const newServer = await this.selectOptimalServer();
-                return this.forwardRequest(req, newServer, retries + 1);
+                try {
+                    const newServer = await this.selectOptimalServer();
+                    logger.info(`Retrying with different server: ${newServer.id}`, {
+                        originalServer: server.id,
+                        retry: retries + 1
+                    });
+                    return this.forwardRequest(req, newServer, retries + 1);
+                } catch (selectionError) {
+                    throw error; // Throw original error if can't select new server
+                }
             }
 
             throw error;
