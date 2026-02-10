@@ -22,72 +22,142 @@ class ApiController {
             
             logger.info('Processing pair request', { number });
             
-            // Select optimal backend server
-            const selectedServer = await this.loadBalancer.selectOptimalServer();
-            
-            logger.info('Selected server for pairing', {
-                server: selectedServer.id,
-                number
-            });
+            // Sélectionner le serveur backend optimal
+            let selectedServer;
+            try {
+                selectedServer = await this.loadBalancer.selectOptimalServer();
+                logger.info('Selected server for pairing', {
+                    server: selectedServer.id,
+                    serverUrl: selectedServer.url,
+                    number
+                });
+            } catch (selectionError) {
+                logger.error('Failed to select server:', {
+                    error: selectionError.message,
+                    number
+                });
+                
+                let statusCode = 503;
+                let errorMessage = 'Service unavailable';
+                
+                switch (selectionError.message) {
+                    case 'ALL_FULL':
+                        errorMessage = `All API servers are full (${CONFIG.MAX_SESSIONS_PER_SERVER}/${CONFIG.MAX_SESSIONS_PER_SERVER})`;
+                        break;
+                    case 'ALL_UNAVAILABLE':
+                        errorMessage = 'All backend servers are unavailable';
+                        break;
+                    case 'NO_ACTIVE_SERVERS':
+                        errorMessage = 'No active backend servers available';
+                        break;
+                }
+                
+                return res.status(statusCode).json(
+                    createResponse(false, null, errorMessage)
+                );
+            }
             
             // Forward request to backend
-            const backendResponse = await this.loadBalancer.forwardRequest(req, selectedServer);
+            let backendResponse;
+            try {
+                backendResponse = await this.loadBalancer.forwardRequest(req, selectedServer);
+                logger.debug('Backend response received', {
+                    server: selectedServer.id,
+                    status: backendResponse.status,
+                    data: backendResponse.data
+                });
+                
+                // Log détaillé de la réponse
+                logger.info('Backend response structure', {
+                    server: selectedServer.id,
+                    hasOk: !!backendResponse.data?.ok,
+                    dataKeys: Object.keys(backendResponse.data || {}),
+                    fullData: backendResponse.data
+                });
+                
+            } catch (forwardError) {
+                logger.error('Failed to forward request to backend:', {
+                    server: selectedServer.id,
+                    error: forwardError.message,
+                    code: forwardError.code,
+                    number,
+                    stack: forwardError.stack
+                });
+                
+                return res.status(503).json(
+                    createResponse(false, null, `Backend server unavailable: ${forwardError.message}`)
+                );
+            }
+            
+            // Check backend response
+            if (!backendResponse.data) {
+                logger.error('Backend returned empty response', {
+                    server: selectedServer.id,
+                    status: backendResponse.status
+                });
+                
+                return res.status(502).json(
+                    createResponse(false, null, 'Backend server returned empty response')
+                );
+            }
+            
+            // Vérifier si le backend a retourné une erreur
+            if (backendResponse.data.error) {
+                logger.error('Backend returned error:', {
+                    server: selectedServer.id,
+                    error: backendResponse.data.error,
+                    status: backendResponse.status
+                });
+                
+                return res.status(backendResponse.status >= 400 ? backendResponse.status : 400).json(
+                    createResponse(false, null, backendResponse.data.error)
+                );
+            }
             
             // Update server session count if pairing successful
             if (backendResponse.data?.ok) {
-                const cacheKey = `sessions_${selectedServer.id}`;
-                const currentCount = await this.serverManager.getServerSessionCount(selectedServer.id);
-                
-                // Extract session ID from response
-                const sessionId = backendResponse.data.sessionId;
-                if (sessionId) {
-                    // Update session mapping
-                    this.serverManager.sessionMap.set(sessionId, selectedServer.id);
+                try {
+                    const currentCount = await this.serverManager.getServerSessionCount(selectedServer.id);
+                    
+                    // Extract session ID from response - VOTRE BACKEND RETOURNE `sessionId` ou `cleanNumber`
+                    const sessionId = backendResponse.data.sessionId || backendResponse.data.cleanNumber;
+                    if (sessionId) {
+                        // Update session mapping
+                        this.serverManager.sessionMap.set(sessionId, selectedServer.id);
+                    }
+                    
+                    logger.info('Pairing successful', {
+                        server: selectedServer.id,
+                        sessionId: sessionId,
+                        code: backendResponse.data.code,
+                        newSessionCount: currentCount + 1,
+                        number
+                    });
+                } catch (updateError) {
+                    logger.warn('Failed to update session count after pairing:', {
+                        error: updateError.message,
+                        server: selectedServer.id
+                    });
+                    // Continue anyway - don't fail the request
                 }
-                
-                logger.info('Pairing successful', {
-                    server: selectedServer.id,
-                    sessionId: backendResponse.data.sessionId,
-                    newSessionCount: currentCount + 1
-                });
             }
             
-            // Return backend response
+            // Return backend response as-is
             res.status(backendResponse.status).json(backendResponse.data);
             
         } catch (error) {
-            logger.error('Pair request failed:', { 
+            logger.error('Unexpected error in pair request:', { 
                 error: error.message,
+                stack: error.stack,
                 number: req.params.number 
             });
             
-            let statusCode = 500;
-            let errorMessage = 'Internal server error';
+            // Never expose internal errors in production
+            const errorMessage = process.env.NODE_ENV === 'production' 
+                ? 'An unexpected error occurred during pairing'
+                : error.message;
             
-            switch (error.message) {
-                case 'ALL_FULL':
-                    statusCode = 503;
-                    errorMessage = `All API servers are full (${CONFIG.MAX_SESSIONS_PER_SERVER}/${CONFIG.MAX_SESSIONS_PER_SERVER})`;
-                    break;
-                    
-                case 'ALL_UNAVAILABLE':
-                    statusCode = 503;
-                    errorMessage = 'All backend servers are unavailable';
-                    break;
-                    
-                case 'NO_ACTIVE_SERVERS':
-                    statusCode = 503;
-                    errorMessage = 'No active backend servers available';
-                    break;
-                    
-                default:
-                    if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
-                        statusCode = 503;
-                        errorMessage = 'Backend server timeout or connection refused';
-                    }
-            }
-            
-            res.status(statusCode).json(
+            res.status(500).json(
                 createResponse(false, null, errorMessage)
             );
         }
